@@ -4,15 +4,26 @@ import * as vscode from 'vscode';
 
 import * as treesitter from 'web-tree-sitter'
 
-import { NumberRange, RangeBinTree } from './ast-btree';
+import { NumberRange, Range, RangeBinTree } from './ast-btree';
 
 import { StringBuilder } from 'typescript-string-operations';
 import ollama from 'ollama';
+
+class VSCodeRange extends Range<vscode.Position> {
+	constructor(start: vscode.Position, end: vscode.Position) {
+        super(start, end, (p1, p2) => {
+			return p1.line !== p2.line 
+					? p1.line - p2.line
+					: p1.character - p2.character;
+		});
+    }
+}
 
 interface DocumentState {
 	text: string,
 	content: Uint8Array;
 	tree: treesitter.Tree | null;
+	rangeTree: RangeBinTree<treesitter.Node> | null;
 };
 
 let parser: treesitter.Parser;
@@ -33,12 +44,22 @@ interface DocumentAnalysis {
 	results: AnalysisReport[]
 };
 
-let documentAnalysisStates = new Map<vscode.Uri, DocumentAnalysis>();
+interface InpectCommandArguments {
+	functions: string[]
+};
 
-function createInspectionMessage(sourceCode: string) {
+interface AnalysisRequest {
+	startLine: number,
+	text: string
+};
+
+let documentAnalysisStates = new Map<vscode.Uri, DocumentAnalysis>();
+let diagnosticsTree = new Map<vscode.Uri, RangeBinTree<vscode.Diagnostic, vscode.Position>>()
+
+function addLineComments(sourceCode: string, startLineNumber: number = 1) {
 	const sb = new StringBuilder();
 
-	let lineCounter = 1;
+	let lineCounter = startLineNumber;
 
 	sourceCode.split('\n').forEach(line =>
 		sb.append(`${line} // line ${lineCounter++}\n`)
@@ -46,9 +67,13 @@ function createInspectionMessage(sourceCode: string) {
 
 	console.log(`PREPROCESSED SRC:\n${sb.toString()}`);
 
+	return sb.toString();
+}
+
+function createInspectionMessage(sourceCode: string) {
 	return `Imagine that you're a static analyser. You have a Go code snippet. Find bugs, vulnerabilities and weaknesses in the code.
 \`\`\`go
-${sb.toString()}
+${sourceCode}
 \`\`\`
 Provide only static analysis results as a JSON array. JSON-format for each bug info is
 \`\`\`json
@@ -61,16 +86,27 @@ Provide only static analysis results as a JSON array. JSON-format for each bug i
   }
 }
 \`\`\`
-JSON result should be enclosed with backticks.`;
+Comments with line numbers are virtual, do not add them to snippet field. Result JSON should be an array enclosed with backticks, array elements should be separated by a comma.`;
 }
 
 let golangDiagnosticCollection: vscode.DiagnosticCollection;
 
-async function inspectCode(sourceCode: string, resultsProcessor?: (arg: AnalysisReport[]) => void, finalizer?: () => void) {
+async function inspectCode(sourceCode: string, /* firstLineNumber?: number, */ resultsProcessor?: (arg: AnalysisReport[]) => void, finalizer?: () => void) {
+	const conf = vscode.workspace.getConfiguration('aiInspection');
+
+	const model = conf.get<string>('model');
+
+	if (!model) {
+		await vscode.window.showErrorMessage('Unable to perform a static analysis because the model used is not specified.');
+
+		return;
+	}
+
 	const message = createInspectionMessage(sourceCode);
 
 	ollama.chat({
-		model: 'qwen3:1.7b',
+		model: model,
+		// model: 'codeqwen:7b',
 		messages: [
 			{
 				role: 'user',
@@ -108,68 +144,190 @@ async function inspectCode(sourceCode: string, resultsProcessor?: (arg: Analysis
 	}).finally(finalizer);
 }
 
-async function checkCode() {
-	const acitveDoc = vscode.window.activeTextEditor?.document;
+function printNode(n: treesitter.Node | null, indent = 0) {
+	if (n == null)
+		return;
 
-	if (acitveDoc) {
-		let docAnalysisState = documentAnalysisStates.get(acitveDoc.uri);
+	const pointStringfier = (point: treesitter.Point) => {
+		return `${point.row}:${point.column}`
+	};
 
-		const sourceCode = acitveDoc.getText();
+	console.log(`${' '.repeat(indent * 4)}${n.type} ${n.startIndex} ${pointStringfier(n.startPosition)} - ${pointStringfier(n.endPosition)} ${n.endIndex} # ${n.childCount === 0 ? n.text + ' :: ' : ''}${n.isError}, ${n.isExtra}, ${n.isMissing}`)
+	n.children.forEach(child => printNode(child, indent + 1))
+}
 
-		if (!docAnalysisState) {
-			docAnalysisState = {
-				results: [],
-				done: true
-			};
+function findFunctionsByNames(tree: RangeBinTree<treesitter.Node>, names: string[]): treesitter.Node[] {
+	const functions: treesitter.Node[] = []
+	const nameSet = new Set<string>(names);
 
-			documentAnalysisStates.set(acitveDoc.uri, docAnalysisState);
+	tree.forEachChildren(n => {
+		if (n.type === 'function_declaration') {
+			const funcName = n.childForFieldName('name')?.text;
+
+			if (funcName && nameSet.has(funcName))
+				functions.push(n);
 		}
+	});
 
-		if (docAnalysisState.done) {
-			docAnalysisState.done = false;
+	return functions;
+}
 
-			inspectCode(sourceCode, results => {
-				const documentDiagnostics: vscode.Diagnostic[] = [];
+function findEnclosingBlock(tree: RangeBinTree<treesitter.Node>, range: Range, grabParentBlock: boolean = true): treesitter.Node | undefined {
+	let enclosings = tree.find(range);
+	let result: treesitter.Node | undefined = undefined;
 
-				results.forEach(result => {
-					const line = result.location.line - 1;
+	while (enclosings && enclosings.length > 0) {
+		const treeNode = enclosings[0];
 
-					console.log(`DEBUG result: ${result.location.line}, ${result.location.snippet}`);
+		if (treeNode.node.childCount == 0 || !range.inside(treeNode.range))
+			break;
 
-					const lineText = acitveDoc.getText(new vscode.Range(
-						line, 0,
-						line, Number.MAX_SAFE_INTEGER
-					));
+		if (treeNode.node.type === 'block')
+			result = (grabParentBlock ? treeNode.node.parent : treeNode.node) || undefined;
 
-					if (lineText === undefined)
-						return;
+		enclosings = treeNode.find(range);
+	}
 
-					const offset = lineText.indexOf(result.location.snippet);
+	return result;
+}
 
-					if (offset < 0)
-						return;
+function retrieveTextFromDocument(doc: vscode.TextDocument, range?: NumberRange, grabParentBlock: boolean = true): AnalysisRequest {
+	if (!range) {
+		return { 
+			text: doc.getText(),
+			startLine: 0
+		};
+	}
 
-					const diag = new vscode.Diagnostic(
+	const docState = documentStates.get(doc.uri);
+
+	if (!docState) {
+		return { 
+			text: doc.getText(),
+			startLine: 0
+		};
+	}
+
+	const node = findEnclosingBlock(docState.rangeTree!, new NumberRange(
+				range.start,
+				range.end
+			), grabParentBlock);
+
+	if (!node) {
+		return { 
+			text: doc.getText(),
+			startLine: 0
+		};
+	}
+
+	return {
+		startLine: node.startPosition.row,
+		text: doc.getText(
+			new vscode.Range(
+				new vscode.Position(node.startPosition.row, node.startPosition.column),
+				new vscode.Position(node.endPosition.row, node.endPosition.column)
+			)
+		)
+	}
+}
+
+async function checkCode(doc: vscode.TextDocument, sourceCode: string, /*edit?: treesitter.Edit, */) {
+	let docAnalysisState = documentAnalysisStates.get(doc.uri);
+
+	if (!docAnalysisState) {
+		docAnalysisState = {
+			results: [],
+			done: true
+		};
+
+		documentAnalysisStates.set(doc.uri, docAnalysisState);
+	}
+
+	// const data = retrieveTextForFastAnalysis(acitveDoc, edit);
+	// const sourceCode = data.text;
+	// const firstLineNo = data.startLine + 1;
+
+	if (docAnalysisState.done) {
+		docAnalysisState.done = false;
+
+		inspectCode(sourceCode, /* firstLineNo, */ results => {
+			if (!diagnosticsTree.has(doc.uri)) {
+				diagnosticsTree.set(doc.uri, new RangeBinTree(
+					new VSCodeRange(
+						new vscode.Position(0, 0),
+						new vscode.Position(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)
+					),
+					new vscode.Diagnostic(
 						new vscode.Range(
-							new vscode.Position(line, offset),
-							new vscode.Position(line, offset + result.location.snippet.length)
-						),
-						result.description,
-						vscode.DiagnosticSeverity.Warning
-					);
-					documentDiagnostics.push(diag);
-				});
+							new vscode.Position(0, 0),
+							new vscode.Position(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)
+						), 
+						'stub'
+					)
+				));
+			}
 
-				golangDiagnosticCollection.set(
-					acitveDoc.uri,
-					documentDiagnostics
+			const ranges = results.map(result => {
+				const line = result.location.line - 1;
+
+				console.log(`DEBUG result: ${result.location.line}, ${result.location.snippet}`);
+
+				const lineText = doc.getText(new vscode.Range(
+					line, 0,
+					line, Number.MAX_SAFE_INTEGER
+				));
+
+				if (lineText === undefined)
+					return;
+
+				const offset = lineText.indexOf(result.location.snippet);
+
+				console.log(`DEBUG result 2: ${line}, ${offset} ${result.location.snippet.length}`);
+
+				if (offset < 0)
+					return;
+
+				const diagnosticsRange = new VSCodeRange(
+						new vscode.Position(line, offset),
+						new vscode.Position(line, offset + result.location.snippet.length)
+					);
+
+				return diagnosticsRange;
+			});
+
+			ranges.forEach(r => r && diagnosticsTree.get(doc.uri)?.removeIntersecting(r));
+
+			ranges.forEach((range, index) => {
+				if (!range)
+					return;
+
+				const diag = new vscode.Diagnostic(
+					new vscode.Range(range.start, range.end),
+					results[index].description,
+					vscode.DiagnosticSeverity.Warning
 				);
 
-				documentAnalysisStates.get(acitveDoc.uri)!.results = results;
-			},
+				diagnosticsTree.get(doc.uri)?.addChild(
+					range,
+					diag
+				);
+			});
 
-			() => documentAnalysisStates.get(acitveDoc.uri)!.done = true)
-		}
+			const documentDiagnostics: vscode.Diagnostic[] = [];
+
+			diagnosticsTree.get(doc.uri)?.forEachChildren(diag =>
+				documentDiagnostics.push(diag)
+			);
+
+			golangDiagnosticCollection.set(
+				doc.uri,
+				documentDiagnostics
+			);
+
+			documentAnalysisStates.get(doc.uri)!.results = results;
+		},
+
+		() => documentAnalysisStates.get(doc.uri)!.done = true)
 	}
 }
 
@@ -185,9 +343,9 @@ function convertContentChangeToTSEdit(doc: vscode.TextDocument, change: vscode.T
 	const startIndex = change.rangeOffset;
 
 	const oldEndPoint: treesitter.Point = convertPositionToTSPoint(change.range.end);
-	const oldEndIndex = doc.offsetAt(change.range.end);
+	const oldEndIndex = change.rangeOffset + change.rangeLength;
 	
-	const newEndIndex = change.rangeOffset + change.rangeLength;
+	const newEndIndex = change.rangeOffset + change.text.length;
 	const newEndPoint: treesitter.Point = convertPositionToTSPoint(doc.positionAt(newEndIndex));
 
 	return {
@@ -215,6 +373,20 @@ function createRangeBTreeNode(n: treesitter.Node): RangeBinTree<treesitter.Node>
 
 let diagnosticCollection: vscode.DiagnosticCollection;
 
+function performCodeCheck(doc: vscode.TextDocument, requests: AnalysisRequest[]) {
+	const sb = new StringBuilder();
+
+	requests.forEach(r => {
+		const startLineNumber = r.startLine + 1;
+
+		sb.append(
+			addLineComments(r.text, startLineNumber)
+		);
+	});
+
+	checkCode(doc, sb.toString());
+}
+
 // This method is called when your extension is activated
 // Your extension is activated the very first time the command is executed
 export async function activate(context: vscode.ExtensionContext) {
@@ -224,14 +396,46 @@ export async function activate(context: vscode.ExtensionContext) {
 	const Golang = await treesitter.Language.load(context.extensionPath + '/parsers/go/tree-sitter-go.wasm');
 	parser.setLanguage(Golang);
 
-	const disposable = vscode.commands.registerCommand('helloworld.helloWorld', () => {
-		vscode.window.showInformationMessage('Hello World from HelloWorld!');
+	const disposable = vscode.commands.registerCommand('aiInspection.runAnalysis', async (args?: InpectCommandArguments) => {
+		let functionsForInspection: string[] = [];
 
-		console.log(
-			vscode.window.activeTextEditor?.document.getText(new vscode.Range(
-				100, 0, 100, Number.MAX_SAFE_INTEGER
-			))
-		);
+		if (args) {
+			functionsForInspection = args.functions;
+		} else {
+			const names = await vscode.window.showInputBox({
+				placeHolder: 'Enter functions names separated with space',
+				prompt: 'Functions to be analyzed'
+			});
+
+			console.log(names);
+
+			if (names && names.length > 0)
+				functionsForInspection = names?.split(' ');
+		}
+
+		const doc = vscode.window.activeTextEditor?.document;
+
+		if (doc && documentStates.get(doc.uri)) {
+			const docState = documentStates.get(doc.uri)!;
+
+			if (functionsForInspection.length == 0) {
+				console.log('Whole text analysis');
+
+				performCodeCheck(doc, [{
+					startLine: 0,
+					text: doc.getText()
+				}]);
+			} else {
+				const functionsRanges = findFunctionsByNames(docState.rangeTree!, functionsForInspection).map(node => ({
+					startLine: node.startPosition.row,
+					text: node.text
+				}));
+
+				performCodeCheck(doc, functionsRanges);
+			}
+
+			console.log(`func name: ${functionsForInspection}, ${functionsForInspection.length}`);
+		}
 	});
 
 	vscode.workspace.onDidChangeTextDocument(e => {
@@ -251,8 +455,22 @@ export async function activate(context: vscode.ExtensionContext) {
 			const newTree = parser.parse(src, oldTree);
 
 			docState.tree = newTree;
+			docState.rangeTree = createRangeBTreeNode(newTree?.rootNode!);
 
-			checkCode();
+			const changeRange = new NumberRange(
+				edit.startIndex,
+				edit.newEndIndex
+			);
+
+			const node = findEnclosingBlock(docState.rangeTree, changeRange);
+
+			node && performCodeCheck(
+				e.document,
+				[{
+					startLine: node.startPosition.row,
+					text: node.text	
+				}]
+			);
 		} else {
 			const tree = parser.parse(src);
 
@@ -262,29 +480,15 @@ export async function activate(context: vscode.ExtensionContext) {
 					{
 						text: src,
 						content: val,
-						tree: tree
+						tree: tree,
+						rangeTree: createRangeBTreeNode(tree?.rootNode!)
 					}
 				)
 			);
 		}
-	})
-
-	const defProvider = vscode.languages.registerDefinitionProvider('java', {
-		provideDefinition(document, position, token) {
-			const range = document.getWordRangeAtPosition(position);
-			console.log(range, token);
-
-			return range && new vscode.Location(
-					vscode.Uri.parse('/Users/aaamoj/main.c'), 
-					range
-				) || new vscode.Location(
-					vscode.Uri.file('/Users/aaamoj/main.c'), 
-					position
-				);
-		}
 	});
 
-	context.subscriptions.push(disposable, defProvider);
+	context.subscriptions.push(disposable);
 
 	golangDiagnosticCollection = vscode.languages.createDiagnosticCollection("go");
 }

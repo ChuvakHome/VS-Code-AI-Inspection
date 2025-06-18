@@ -117,14 +117,36 @@ export class RangeBinTree<T, RType = number> {
         children.forEach(this.addChildNode);
     }
 
-    find(range: Range<RType>): RangeBinTree<T, RType>[] {
-        const nodes: RangeBinTree<T, RType>[] = [];
+    remove(range: Range<RType>) {
+        this.children.delete(range);
+    }
+
+    removeAll(ranges: IterableIterator<Range<RType>>) {
+        forEachIter(
+            ranges,
+            r => this.remove(r)
+        );
+    }
+
+    forEach(processFn: (arg: T) => void) {
+        processFn(this.node);
+
+        this.forEachChildren(processFn);
+    }
+
+    forEachChildren(processFn: (arg: T) => void) {
+        this.children.forEach(n => processFn(n.node));
+    }
+
+    private processIntersecting(range: Range<RType>, processFn?: (arg: [Range<RType>, RangeBinTree<T, RType>]) => void) {
+        if (!processFn)
+            return;
 
         const lowerKeysIter = this._children.splitLower(range).reverseKeys();
 
         forEachIter(
             lowerKeysIter,
-            r => nodes.push(this._children.get(r)!),
+            r => processFn([r, this._children.get(r)!]),
             r => !r.intersects(range) && !r.inside(range)
         );
 
@@ -132,12 +154,36 @@ export class RangeBinTree<T, RType = number> {
 
         forEachIter(
             higherEntriesIter,
-            entry => nodes.push(entry[1]),
+            entry => processFn(entry),
             entry => {
                 const r = entry[0];
 
                 return !r.intersects(range) && !r.inside(range)
             }
+        );
+    }
+
+    removeIntersecting(range: Range<RType>) {
+        this.processIntersecting(
+            range,
+            entry => this.remove(entry[0])
+        );
+    }
+
+    replaceIntersecting(range: Range<RType>, value: T) {
+        this.removeIntersecting(range);
+        this.addChild(
+            range,
+            value
+        );
+    }
+
+    find(range: Range<RType>): RangeBinTree<T, RType>[] {
+        const nodes: RangeBinTree<T, RType>[] = [];
+
+        this.processIntersecting(
+            range,
+            entry => nodes.push(entry[1])
         );
 
         return nodes;

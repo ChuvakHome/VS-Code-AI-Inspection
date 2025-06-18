@@ -1,6 +1,6 @@
 {
-  "name": "helloworld",
-  "displayName": "HelloWorld",
+  "name": "ai-inspection",
+  "displayName": "AI Inspection",
   "description": "",
   "version": "0.0.1",
   "engines": {
@@ -11,17 +11,27 @@
   ],
   "activationEvents": [
     "onLanguage:go",
-    "onLanguage:golang",
-    "onLanguage:java"
+    "onLanguage:golang"
   ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "helloworld.helloWorld",
-        "title": "Hello World"
+        "command": "aiInspection.runAnalysis",
+        "title": "Run AI-based static analysis"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "AI inspection extension settings",
+      "properties": {
+        "aiInspection.model": {
+          "type": "string",
+          "default": "qwen3:1.7b",
+          "description": "Model for performing static analysis of the code.",
+          "minLength": 1
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
